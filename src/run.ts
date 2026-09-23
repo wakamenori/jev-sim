@@ -1,101 +1,121 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
 import { KING } from "./cast.ts";
-import { fmt, MODEL, saveCache, stats } from "./jev.ts";
-import { llmStats } from "./llm.ts";
-import { reviewAll } from "./review.ts";
-import { buildWorld, candidates, closeDay, endDay, kingDecide, runTurn, startDay, TURNS } from "./sim.ts";
-import { planAll } from "./strategy.ts";
-import type { Override, World } from "./types.ts";
+import { type ChooseAction, chooseAction as defaultChooseAction } from "./decision.ts";
+import { createJevClient, MODEL } from "./jev.ts";
+import { createLlmClient } from "./llm.ts";
+import type { ObserveModel } from "./model-events.ts";
+import { createRunLog, writeJson } from "./run-log.ts";
+import { simulate } from "./simulation.ts";
+import type { World } from "./types.ts";
+import { buildWorld } from "./world.ts";
 
 export interface RunOptions {
-  /** N 日目まで回して止める（指名はしない） */
+  /** Stop after this day; the final day includes the King's decision. */
   until?: number;
-  overrides?: Override[];
-  forkOf?: string;
-  /** 1 日ごとの出来事を標準出力に出す */
   verbose?: boolean;
   label?: string;
+  outputDir?: string;
+  print?: (line: string) => void;
+  /** CLI only: save diagnostics before terminating on SIGINT/SIGTERM. */
+  handleSignals?: boolean;
 }
 
-export async function runSim(opts: RunOptions = {}): Promise<{ world: World; file: string }> {
-  const w = buildWorld();
-  w.meta = {
-    model: MODEL,
-    startedAt: new Date().toISOString(),
-    overrides: opts.overrides,
-    forkOf: opts.forkOf,
+export function createModelClients(observe?: ObserveModel) {
+  return {
+    ...createJevClient({ cachePath: "cache/jev-cache.json", observe }),
+    ...createLlmClient("cache/llm-cache.json", observe),
   };
-  const name = (id: string) => w.people[id]?.name ?? id;
-  const until = Math.min(opts.until ?? w.totalDays, w.totalDays);
-  const before = { ...stats };
-  const t0 = performance.now();
-  try {
-    for (let d = 1; d <= until; d++) {
-      const td = performance.now();
-      const callsBefore = stats.calls;
-      startDay(w);
-      const tp = performance.now();
-      const plans = await planAll(w);
-      w.plans.push(...plans);
-      const planSec = ((performance.now() - tp) / 1000).toFixed(1);
-      for (let t = 1; t <= TURNS; t++) {
-        w.turn = t;
-        await runTurn(w);
-        saveCache();
-      }
-      await endDay(w);
-      saveCache();
-      // 個人の整理（Luna、全員）: 他人の推測・頭目への報告・翌日の狙い
-      const tr = performance.now();
-      await reviewAll(w);
-      closeDay(w);
-      const reviewSec = ((performance.now() - tr) / 1000).toFixed(1);
-      const s = w.kingSuitability.at(-1) ?? {};
-      const kingLine = candidates(w)
-        .map((c) => `${c.name} ${(s[c.id] ?? 0).toFixed(2)}`)
-        .join(" / ");
-      if (opts.verbose) {
-        console.log(`\n===== Day ${w.day} =====`);
-        for (const e of w.events.filter((e) => e.day === w.day && e.kind !== "assess")) {
-          const causes = e.causes.length ? ` (<- ${e.causes.map((c) => `#${c}`).join(",")})` : "";
-          console.log(`#${e.id}${causes} ${e.text}`);
-        }
-        for (const p of plans)
-          console.log(
-            `-- 計画 ${p.faction}: ${p.aims.join(" / ")} (moves ${p.moves.length}, rejected ${p.rejected.length})`,
-          );
-        console.log(`-- 王の評価: ${kingLine}`);
-      }
-      console.log(
-        `[day ${w.day}] ${((performance.now() - td) / 1000).toFixed(1)}s (plan ${planSec}s, review ${reviewSec}s) jev=${stats.calls - callsBefore} | ${kingLine}`,
-      );
-    }
-    if (until >= w.totalDays) {
-      const { heir, probabilities } = await kingDecide(w);
-      console.log(`[heir] ${name(heir)} [${fmt(probabilities)}]`);
-    }
-  } finally {
-    saveCache();
-    w.meta.finishedAt = new Date().toISOString();
-    w.meta.jev = {
-      calls: stats.calls - before.calls,
-      cacheHits: stats.cacheHits - before.cacheHits,
-      retries: stats.retries - before.retries,
-      inputTokens: stats.inputTokens - before.inputTokens,
-    };
-  }
-  mkdirSync("out/runs", { recursive: true });
-  const suffix = opts.label ? `-${opts.label}` : "";
-  const file = `out/runs/${w.meta.startedAt.replace(/[:.]/g, "-")}${suffix}.json`;
-  writeFileSync(file, JSON.stringify(w));
-  const j = w.meta.jev;
-  console.log(
-    `[jev] calls=${j.calls} cacheHits=${j.cacheHits} retries=${j.retries} [llm] calls=${llmStats.calls} cacheHits=${llmStats.cacheHits} wall=${((performance.now() - t0) / 1000).toFixed(1)}s -> ${file}`,
-  );
-  return { world: w, file };
 }
 
-/** 王以外の支持の集計。表示用 */
+/** CLI-facing runner. Persistence and model clients stay outside the simulation. */
+export async function runSim(
+  opts: RunOptions = {},
+  makeClients: typeof createModelClients = createModelClients,
+  decorateChoice?: (choose: ChooseAction) => ChooseAction,
+): Promise<{ world: World; file: string }> {
+  if (opts.label && !/^[\w-]+$/.test(opts.label)) throw new Error("Invalid run label");
+  const w = buildWorld();
+  if (
+    opts.until !== undefined &&
+    (!Number.isInteger(opts.until) || opts.until < 0 || opts.until > w.totalDays)
+  )
+    throw new Error(`Invalid final day: ${opts.until}`);
+  const meta = { model: MODEL, startedAt: new Date().toISOString() } as NonNullable<World["meta"]>;
+  w.meta = meta;
+  const runId = `${meta.startedAt.replace(/[:.]/g, "-")}-${randomUUID().slice(0, 8)}${opts.label ? `-${opts.label}` : ""}`;
+  const root = opts.outputDir ?? "out";
+  const dir = join(root, "logs", runId);
+  const print = opts.print ?? console.log;
+  const log = createRunLog(dir, runId, print, opts.until ?? w.totalDays);
+  let clients: ReturnType<typeof createModelClients> | undefined;
+  const flushAfterFailure = () => {
+    try {
+      clients?.saveCache();
+    } catch (error) {
+      log.persistenceFailed(error);
+    }
+  };
+  const savePartial = () => writeJson(join(dir, "partial-world.json"), w);
+  const interrupt = (signal: NodeJS.Signals) => {
+    try {
+      flushAfterFailure();
+      savePartial();
+      log.finish("interrupted", Object.assign(new Error(signal), { code: signal }));
+    } finally {
+      process.exit(signal === "SIGINT" ? 130 : 143);
+    }
+  };
+  if (opts.handleSignals) {
+    process.once("SIGINT", interrupt);
+    process.once("SIGTERM", interrupt);
+  }
+  try {
+    writeJson(join(dir, "checkpoint.json"), w);
+    clients = makeClients(log.observe);
+    const before = { ...clients.stats };
+    const { ask, generate } = clients;
+    const chooseAction = decorateChoice?.((world, actor, support) =>
+      defaultChooseAction(ask, world, actor, support),
+    );
+    await simulate(
+      w,
+      { ask, generate, chooseAction },
+      opts.until,
+      () => {
+        writeJson(join(dir, "checkpoint.json"), w);
+        log.dayCompleted(w.day);
+        clients?.saveCache();
+        if (opts.verbose)
+          for (const e of w.events.filter((e) => e.day === w.day)) print(`#${e.id} ${e.text}`);
+      },
+      log.observePhase,
+    );
+    clients.saveCache();
+    meta.finishedAt = new Date().toISOString();
+    meta.jev = {
+      calls: clients.stats.calls - before.calls,
+      cacheHits: clients.stats.cacheHits - before.cacheHits,
+      retries: clients.stats.retries - before.retries,
+      inputTokens: clients.stats.inputTokens - before.inputTokens,
+    };
+    mkdirSync(join(root, "runs"), { recursive: true });
+    const file = join(root, "runs", `${runId}.json`);
+    writeJson(file, w);
+    log.finish("completed", undefined, file);
+    return { world: w, file };
+  } catch (error) {
+    flushAfterFailure();
+    savePartial();
+    log.finish("failed", error);
+    throw error;
+  } finally {
+    process.removeListener("SIGINT", interrupt);
+    process.removeListener("SIGTERM", interrupt);
+  }
+}
+
 export function supportTally(w: World): Record<string, string[]> {
   const tally: Record<string, string[]> = {};
   for (const [pid, m] of Object.entries(w.minds)) {

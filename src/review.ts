@@ -4,39 +4,22 @@
 //   3. 翌日の自分の狙いと、打ちたい手
 // 本心の支持は変えない（支持は出来事への反応として Jev が決める）。
 import { z } from "zod";
+import { enumerateActions, toKey } from "./actions.ts";
 import { KING } from "./cast.ts";
-import { DEFAULT_LLM, generate } from "./llm.ts";
+import { TURNS } from "./constants.ts";
+import { describe, describeAction } from "./describe.ts";
+import { DEFAULT_LLM, type Generate } from "./generation.ts";
 import { sightingLine } from "./perception.ts";
-import {
-  addKnowers,
-  candidates,
-  describe,
-  describeAction,
-  enumerateActions,
-  factionOf,
-  remember,
-  sameSide,
-  TURNS,
-} from "./sim.ts";
-import { KINDS, toKey } from "./strategy.ts";
+import { moveSchema } from "./planning.ts";
+import { addKnowers, candidates, factionOf, leaderOf, remember, sameSide } from "./rules.ts";
 import type { Id, World } from "./types.ts";
 
 const name = (w: World, id: Id) => w.people[id]?.name ?? id;
 
-/** pid が報告する相手（陣営の頭目）。頭目本人、属さない人、恐れて従っている人には無い */
-export function leaderOf(w: World, pid: Id): Id | undefined {
-  const c = w.minds[pid].support;
-  if (c === "undecided" || !factionOf(w, c).includes(pid)) return undefined;
-  const lead = Object.values(w.people).find((p) => p.advisorOf === c)?.id;
-  return lead && lead !== pid ? lead : undefined;
-}
-
-export async function reviewPerson(w: World, pid: Id, model = DEFAULT_LLM) {
+export async function reviewPerson(generate: Generate, w: World, pid: Id, model = DEFAULT_LLM) {
   const m = w.minds[pid];
   const others = Object.keys(w.people).filter((id) => id !== pid && id !== KING && !w.people[id].candidate);
   const lead = leaderOf(w, pid);
-  const ids: [string, ...string[]] = ["none", ...Object.keys(w.people)];
-  const factIds: [string, ...string[]] = ["none", ...Object.keys(w.facts)];
   const stance: [string, ...string[]] = ["unknown", "undecided", ...candidates(w).map((c) => c.id)];
   const schema = z.object({
     beliefs: z
@@ -61,18 +44,7 @@ export async function reviewPerson(w: World, pid: Id, model = DEFAULT_LLM) {
       ),
     aims: z.array(z.string()).describe("1-3 short aims for tomorrow, in your own interest"),
     moves: z
-      .array(
-        z.object({
-          kind: z.enum(KINDS),
-          target: z.enum(ids),
-          fact: z.enum(factIds),
-          visitor: z.enum(ids),
-          host: z.enum(ids),
-          channel: z.enum(["none", "king", "court", ...Object.keys(w.people)] as [string, ...string[]]),
-          evidence: z.enum(["none", ...Object.keys(w.evidence)] as [string, ...string[]]),
-          purpose: z.string(),
-        }),
-      )
+      .array(moveSchema(w))
       .describe(`up to ${TURNS} moves you intend for tomorrow, chosen from your list`),
   });
   const system = [
@@ -99,7 +71,7 @@ export async function reviewPerson(w: World, pid: Id, model = DEFAULT_LLM) {
     `Day ${w.day} of ${w.totalDays} is over. Take stock and plan tomorrow.`,
   ].join("\n");
 
-  const out = await generate({ model, system, prompt, schema, schemaVersion: "review-v6" });
+  const out = await generate({ model, system, prompt, schema });
 
   return () => {
     for (const b of out.beliefs) {
@@ -177,8 +149,8 @@ function report(w: World, pid: Id, lead: Id, threats: boolean, rivals: boolean) 
 }
 
 /** 王以外の全員の整理を並列に行い、決まった順で書き戻す */
-export async function reviewAll(w: World, model?: string) {
+export async function reviewAll(generate: Generate, w: World, model?: string) {
   const ids = Object.keys(w.people).filter((id) => id !== KING);
-  const applies = await Promise.all(ids.map((id) => reviewPerson(w, id, model)));
+  const applies = await Promise.all(ids.map((id) => reviewPerson(generate, w, id, model)));
   for (const apply of applies) apply();
 }

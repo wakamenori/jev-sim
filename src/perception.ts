@@ -1,7 +1,7 @@
 // 見られることと、他人についての推測。
 // 人は自分が見聞きしたことしか知らない。他人の支持は、公の立場と観察と働きかけから推測する。
 import { KING, publicStance, watchers } from "./cast.ts";
-import { makeRng } from "./jev.ts";
+import { makeRng } from "./random.ts";
 import type { BeliefAboutPerson, Id, World } from "./types.ts";
 
 const name = (w: World, id: Id) => w.people[id]?.name ?? id;

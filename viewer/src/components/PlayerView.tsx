@@ -11,16 +11,17 @@ export function PlayerView({ ix, pid, day }: { ix: Index; pid: Id; day: number }
   const snap = ix.snapshotAt(d).minds[pid];
   const facts = (id: Id) => w.facts[id]?.text ?? id;
 
-  const actions = m.actionLog.filter((a) => a.day === d);
-  const heard = m.testimony.filter((t) => t.day === d);
-  const visits = m.sightings.filter((s) => s.day === d);
-  const reports = m.reports.filter((r) => r.day === d);
-  const plan = w.plans.find((p) => p.day === d && p.lead === pid);
+  const actions = (m.actionLog ?? []).filter((a) => a.day === d);
+  const heard = (m.testimony ?? []).filter((t) => t.day === d);
+  const visits = (m.sightings ?? []).filter((s) => s.day === d);
+  const reports = (m.reports ?? []).filter((r) => r.day === d);
+  const plan = (w.plans ?? []).find((p) => p.day === d && p.lead === pid);
   const heir = [...w.events].reverse().find((e) => e.kind === "name_heir");
   const isLast = d === (ix.days.at(-1) ?? 0);
 
   return (
     <div className="player">
+      {!m.actionLog && <p className="muted small">このログには個人の行動・反応の記録がありません。</p>}
       <section className="col">
         <h2>
           {ix.name(pid)} の {d} 日目

@@ -2,33 +2,13 @@
 // 出力の人物・事実は列挙型で縛り、一手は Jev の選択肢と同じ鍵にして、今とれる行動かをコードで検証する。
 // 計画は各人物の state に「陣営の計画」として入り、選択肢にも印が付く。最終的に選ぶのは Jev。
 import { z } from "zod";
-import { DEFAULT_LLM, generate } from "./llm.ts";
-import {
-  backedAtCourt,
-  candidates,
-  describe,
-  describeAction,
-  enumerateActions,
-  factionOf,
-  isOurSecret,
-  TURNS,
-} from "./sim.ts";
+import { enumerateActions, toKey } from "./actions.ts";
+import { TURNS } from "./constants.ts";
+import { describe, describeAction } from "./describe.ts";
+import { DEFAULT_LLM, type Generate } from "./generation.ts";
+import { moveSchema, notOrderable } from "./planning.ts";
+import { backedAtCourt, candidates, factionOf } from "./rules.ts";
 import type { FactionPlan, Id, PlannedMove, World } from "./types.ts";
-
-export const KINDS = [
-  "tell",
-  "urge",
-  "probe",
-  "request",
-  "threaten",
-  "order",
-  "silence",
-  "accuse",
-  "tellseen",
-  "give",
-  "destroy",
-  "extort",
-] as const;
 
 const ACTION_GUIDE = `Actions a member can take in one part of the day (there are ${TURNS} parts per day, one action each):
 - tell: privately tell a person a fact the member knows (the listener also learns whom the member heard it from)
@@ -83,22 +63,6 @@ function yesterdayRejected(w: World, candidate: Id): string {
 }
 
 /**
- * 頭目が指示できない手なら、その理由。どちらも預かり手本人の判断にする
- * （頭目は預かり手が証拠を手放せない理由を知らず、指示すると預かり手はそれに従ってしまう）
- *   - 証拠の処分
- *   - 自分や自陣営を困らせる証拠を陣営の外へ渡すこと（実測で、将軍が自分の反逆の証拠を指示どおり差し出した）
- */
-function notOrderable(w: World, actor: Id, key: string): string | undefined {
-  if (key.startsWith("destroy:")) return "only the holder can decide to destroy evidence";
-  if (key.startsWith("give:")) {
-    const e = w.evidence[key.split(":")[2]];
-    if (e && isOurSecret(w, actor, e.fact))
-      return "only the holder can decide to hand over evidence that hurts your own side";
-  }
-  return undefined;
-}
-
-/**
  * メンバーごとの、今とれる手の一覧（Jev の選択肢の鍵そのもの）。
  * 規則を説明するだけでは、参謀は実行できない手を考え続け、弾かれた残りが王への説得だけになる。
  */
@@ -113,26 +77,8 @@ function menus(w: World, members: Id[]): string {
     .join("\n");
 }
 
-export function toKey(m: {
-  kind: string;
-  target: string;
-  fact: string;
-  visitor: string;
-  host: string;
-  channel: string;
-  evidence: string;
-}): string {
-  if (m.kind === "accuse") return `accuse:${m.fact}`;
-  if (m.kind === "give") return `give:${m.target}:${m.evidence}`;
-  if (m.kind === "destroy") return `destroy:${m.evidence}`;
-  if (m.kind === "extort") return `extort:${m.target}:${m.fact}:${m.evidence}`;
-  if (m.kind === "threaten") return `threaten:${m.target}:${m.fact}:${m.channel}`;
-  if (m.kind === "tellseen") return `tellseen:${m.target}:${m.visitor}:${m.host}`;
-  if (m.kind === "urge" || m.kind === "probe") return `${m.kind}:${m.target}`;
-  return `${m.kind}:${m.target}:${m.fact}`;
-}
-
 export async function makePlan(
+  generate: Generate,
   w: World,
   candidate: Id,
   model = DEFAULT_LLM,
@@ -140,8 +86,6 @@ export async function makePlan(
   const lead = Object.values(w.people).find((p) => p.advisorOf === candidate)?.id ?? candidate;
   const members = factionOf(w, candidate);
   if (!members.includes(lead)) return undefined;
-  const ids: [string, ...string[]] = ["none", ...Object.keys(w.people)];
-  const factIds: [string, ...string[]] = ["none", ...Object.keys(w.facts)];
   const schema = z.object({
     assessment: z
       .string()
@@ -149,20 +93,8 @@ export async function makePlan(
     aims: z.array(z.string()).describe("1-3 short aims for today only, most important first"),
     moves: z
       .array(
-        z.object({
+        moveSchema(w).extend({
           actor: z.enum(members as [string, ...string[]]).describe("the faction member who acts"),
-          kind: z.enum(KINDS),
-          target: z.enum(ids).describe('the person approached; "none" for accuse'),
-          fact: z.enum(factIds).describe('the fact used; "none" for urge, probe and tellseen'),
-          visitor: z.enum(ids).describe('for tellseen: who was visiting; otherwise "none"'),
-          host: z.enum(ids).describe('for tellseen: whom they visited; otherwise "none"'),
-          channel: z
-            .enum(["none", "king", "court", ...Object.keys(w.people)] as [string, ...string[]])
-            .describe('for threaten: how you would expose it; otherwise "none"'),
-          evidence: z
-            .enum(["none", ...Object.keys(w.evidence)] as [string, ...string[]])
-            .describe('for give, destroy and extort: the evidence; otherwise "none"'),
-          purpose: z.string().describe("one short sentence"),
         }),
       )
       .describe(
@@ -202,7 +134,7 @@ export async function makePlan(
     `It is the start of day ${w.day} of ${w.totalDays}. Plan today: give every member ${TURNS} moves, one for each part of the day. A member left without a plan acts on their own and tends to repeat what they did before.`,
   ].join("\n");
 
-  const out = await generate({ model, system, prompt, schema, schemaVersion: "plan-v13" });
+  const out = await generate({ model, system, prompt, schema });
   const plan: FactionPlan = {
     day: w.day,
     faction: candidate,
@@ -221,11 +153,10 @@ export async function makePlan(
     const reason =
       n >= TURNS
         ? "too many moves for one member"
-        : notOrderable(w, m.actor, move.action)
-          ? notOrderable(w, m.actor, move.action)
-          : !enumerateActions(w, m.actor).includes(move.action)
+        : (notOrderable(w, m.actor, move.action) ??
+          (!enumerateActions(w, m.actor).includes(move.action)
             ? "not an action the member can take now"
-            : undefined;
+            : undefined));
     if (reason) {
       plan.rejected.push({ move, reason });
       continue;
@@ -237,7 +168,7 @@ export async function makePlan(
 }
 
 /** 全陣営の計画を並列に立てる */
-export async function planAll(w: World, model?: string): Promise<FactionPlan[]> {
-  const plans = await Promise.all(candidates(w).map((c) => makePlan(w, c.id, model)));
+export async function planAll(generate: Generate, w: World, model?: string): Promise<FactionPlan[]> {
+  const plans = await Promise.all(candidates(w).map((c) => makePlan(generate, w, c.id, model)));
   return plans.filter((p): p is FactionPlan => p !== undefined);
 }

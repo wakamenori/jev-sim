@@ -6,7 +6,7 @@
     "useIgnoreFile": true
   },
   "files": {
-    "includes": ["src/**", "scripts/**", "viewer/**", "*.json"]
+    "includes": ["src/**", "scripts/**", "experiments/**", "tests/**", "viewer/**", "*.json"]
   },
   "formatter": {
     "enabled": true,
@@ -17,7 +17,7 @@
   "linter": {
     "enabled": true,
     "rules": {
-      "recommended": true,
+      "preset": "recommended",
       "suspicious": {
         "noExplicitAny": "warn"
       }

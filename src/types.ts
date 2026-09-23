@@ -167,21 +167,7 @@ export interface Snapshot {
   >;
 }
 
-/** 介入：ある日のある人の判断を、Jev の答えに関係なく指定の値に固定する */
-export interface Override {
-  day: number;
-  /** 省略時はその日の全ターン（support）/ 1 ターン目（action） */
-  turn?: number;
-  actor: Id;
-  field: "action" | "support";
-  /** action なら行動の鍵（例 tell:hubert:f_skim） */
-  value: string;
-}
-
 export interface RunMeta {
-  overrides?: Override[];
-  /** 介入実行の元になった実行（ファイル名） */
-  forkOf?: string;
   model: string;
   startedAt: string;
   finishedAt?: string;
